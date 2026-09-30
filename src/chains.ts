@@ -6,9 +6,10 @@
  * All of them implement EIP-1559 `eth_feeHistory`, which is what makes the
  * premium endpoints possible (base-fee trend + priority-fee percentiles).
  *
- * Two env hooks keep ops flexible without touching code:
+ * Three env hooks keep ops flexible without touching code:
  *   - `RPC_URL_<CHAIN_ID>` overrides one endpoint (uppercase, `-` -> `_`).
  *   - `CHAINS` restricts the registry to a comma-separated subset.
+ *   - `USD_PRICES=0` disables the (optional) native-token price lookup.
  */
 const env = (key: string, fallback = ""): string => (process.env[key] ?? "").trim() || fallback;
 
@@ -20,16 +21,23 @@ export interface ChainSpec {
   nativeDecimals: number;
   /** Supports eth_feeHistory (EIP-1559 fee market). */
   eip1559: boolean;
+  /**
+   * DeFiLlama / CoinGecko id for the native token, used only to turn a native
+   * cost into USD. `null` = no public price, in which case USD fields are
+   * omitted instead of failing the request.
+   */
+  coingeckoId: string | null;
 }
 
 const REGISTRY: ChainSpec[] = [
-  { id: "ethereum", label: "Ethereum", rpcUrl: "https://ethereum-rpc.publicnode.com", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true },
-  { id: "base", label: "Base", rpcUrl: "https://mainnet.base.org", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true },
-  { id: "arbitrum", label: "Arbitrum One", rpcUrl: "https://arbitrum-one-rpc.publicnode.com", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true },
-  { id: "optimism", label: "OP Mainnet", rpcUrl: "https://optimism-rpc.publicnode.com", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true },
-  { id: "polygon", label: "Polygon PoS", rpcUrl: "https://polygon-bor-rpc.publicnode.com", nativeSymbol: "POL", nativeDecimals: 18, eip1559: true },
-  { id: "kite", label: "Kite", rpcUrl: "https://rpc.gokite.ai", nativeSymbol: "KITE", nativeDecimals: 18, eip1559: true },
-  { id: "kite-testnet", label: "Kite Testnet", rpcUrl: "https://rpc-testnet.gokite.ai", nativeSymbol: "KITE", nativeDecimals: 18, eip1559: true },
+  { id: "ethereum", label: "Ethereum", rpcUrl: "https://ethereum-rpc.publicnode.com", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true, coingeckoId: "ethereum" },
+  { id: "base", label: "Base", rpcUrl: "https://mainnet.base.org", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true, coingeckoId: "ethereum" },
+  { id: "arbitrum", label: "Arbitrum One", rpcUrl: "https://arbitrum-one-rpc.publicnode.com", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true, coingeckoId: "ethereum" },
+  { id: "optimism", label: "OP Mainnet", rpcUrl: "https://optimism-rpc.publicnode.com", nativeSymbol: "ETH", nativeDecimals: 18, eip1559: true, coingeckoId: "ethereum" },
+  { id: "polygon", label: "Polygon PoS", rpcUrl: "https://polygon-bor-rpc.publicnode.com", nativeSymbol: "POL", nativeDecimals: 18, eip1559: true, coingeckoId: "polygon-ecosystem-token" },
+  // Kite has no public USD price feed yet, so USD fields are simply omitted.
+  { id: "kite", label: "Kite", rpcUrl: "https://rpc.gokite.ai", nativeSymbol: "KITE", nativeDecimals: 18, eip1559: true, coingeckoId: null },
+  { id: "kite-testnet", label: "Kite Testnet", rpcUrl: "https://rpc-testnet.gokite.ai", nativeSymbol: "KITE", nativeDecimals: 18, eip1559: true, coingeckoId: null },
 ];
 
 const envKeyFor = (id: string): string => `RPC_URL_${id.toUpperCase().replace(/-/g, "_")}`;

@@ -30,7 +30,19 @@ import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { HTTPFacilitatorClient } from "@x402/core/server";
 import { FACILITATOR_URL, kiteChainByName, kiteMoneyParser } from "./kite.js";
 import { allChains, parseChainIds, resolveChains, type ChainSpec } from "./chains.js";
-import { estimateCost, historyFromFeeHistory, snapshotFromFeeHistory, weiToGwei } from "./gasmath.js";
+import {
+  adviceFrom,
+  avgGasUsedRatio,
+  blobBaseFeeGwei,
+  estimateCost,
+  hexToBigInt,
+  historyFromFeeHistory,
+  seriesStats,
+  snapshotFromFeeHistory,
+  trendOf,
+  weiToGwei,
+  type FeeSnapshot,
+} from "./gasmath.js";
 
 const env = (key: string, fallback = ""): string => (process.env[key] ?? "").trim() || fallback;
 const money = (v: string): string => (v.startsWith("$") ? v : `$${v}`);
@@ -51,6 +63,12 @@ const MAX_CHAINS = Number(env("MAX_CHAINS", "10"));
 const SNAPSHOT_BLOCKS = Math.min(Math.max(Number(env("SNAPSHOT_BLOCKS", "5")) || 5, 1), 100);
 const MAX_HISTORY_BLOCKS = Number(env("MAX_HISTORY_BLOCKS", "100"));
 const MAX_GAS_LIMIT = 30_000_000;
+
+// Optional USD conversion for /v1/estimate. Deliberately non-blocking: if the
+// price upstream is unreachable, or the chain has no public price, the USD
+// fields are omitted instead of failing a request the client already paid for.
+const PRICE_URL = env("PRICE_URL", "https://coins.llama.fi").replace(/\/$/, "");
+const USD_PRICES = env("USD_PRICES", "1") !== "0";
 
 // Tiered pricing. Public RPC is free, so the split reflects *value*: a current
 // snapshot is cheap; the history series and cost estimation are premium.
@@ -134,6 +152,7 @@ const cache = new Map<string, CacheEntry>();
 const CACHE_MAX = 200;
 const TTL_GAS_MS = Number(env("CACHE_TTL_GAS_MS", "10000"));
 const TTL_HISTORY_MS = Number(env("CACHE_TTL_HISTORY_MS", "60000"));
+const TTL_PRICE_MS = Number(env("CACHE_TTL_PRICE_MS", "60000"));
 
 function getCache(key: string): CacheEntry | null {
   const e = cache.get(key);
@@ -191,6 +210,94 @@ async function rpcCached(rpcUrl: string, method: string, params: unknown[], ttl:
 const feeHistoryFor = (spec: ChainSpec, blocks: number, ttl: number): Promise<unknown> =>
   rpcCached(spec.rpcUrl, "eth_feeHistory", [toHex(blocks), "latest", [10, 50, 90]], ttl);
 
+export interface ChainGasData {
+  snapshot: FeeSnapshot;
+  /** Blocks the sample covers, oldest first. */
+  blockNumbers: number[];
+  /** Base fee per sampled block (gwei) — the window the advice is computed over. */
+  baseFeeGwei: number[];
+  /** Priority-fee percentiles per sampled block (gwei). */
+  priorityGwei: { slow: number[]; normal: number[]; fast: number[] };
+  /** Mean block fullness over the window (0–1), or null when the node omits it. */
+  congestion: number | null;
+  /** Latest EIP-4844 blob base fee in gwei, or null. */
+  blobBaseFeeGwei: number | null;
+  /** Raw per-block fullness series, for the history endpoint. */
+  gasUsedRatio: number[];
+}
+
+/**
+ * One chain's fee data. EIP-1559 chains get everything from a single
+ * `eth_feeHistory` call; the rest fall back to `eth_gasPrice`, which has no
+ * priority-fee market (so the priority fees are reported as 0, not invented).
+ */
+export async function fetchGasData(spec: ChainSpec, blocks: number, ttl: number): Promise<ChainGasData> {
+  if (!spec.eip1559) {
+    const [gasPrice, blockNumber] = await Promise.all([
+      rpcCached(spec.rpcUrl, "eth_gasPrice", [], ttl),
+      rpcCached(spec.rpcUrl, "eth_blockNumber", [], ttl).catch(() => "0x0"),
+    ]);
+    const wei = hexToBigInt(gasPrice);
+    return {
+      snapshot: {
+        blockNumber: Number(hexToBigInt(blockNumber)),
+        baseFeeWei: wei,
+        nextBaseFeeWei: wei,
+        priority: { slow: 0n, normal: 0n, fast: 0n },
+      },
+      blockNumbers: [Number(hexToBigInt(blockNumber))],
+      baseFeeGwei: [weiToGwei(wei)],
+      priorityGwei: { slow: [0], normal: [0], fast: [0] },
+      congestion: null,
+      blobBaseFeeGwei: null,
+      gasUsedRatio: [],
+    };
+  }
+
+  const fh = await feeHistoryFor(spec, blocks, ttl);
+  const series = historyFromFeeHistory(fh);
+  const raw = (fh ?? {}) as { gasUsedRatio?: unknown };
+  return {
+    snapshot: snapshotFromFeeHistory(fh),
+    blockNumbers: series.blockNumbers,
+    baseFeeGwei: series.baseFeeGwei,
+    priorityGwei: series.priority,
+    congestion: avgGasUsedRatio(fh),
+    blobBaseFeeGwei: blobBaseFeeGwei(fh),
+    gasUsedRatio: Array.isArray(raw.gasUsedRatio) ? raw.gasUsedRatio.map((v) => Number(v)).filter((v) => Number.isFinite(v)) : [],
+  };
+}
+
+/** Cached plain-JSON GET with the same hard timeout as the RPC calls. */
+async function fetchJsonCached(url: string, ttl: number): Promise<any> {
+  const hit = getCache(url);
+  if (hit) return JSON.parse(hit.body.toString("utf8"));
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), RPC_TIMEOUT_MS);
+  try {
+    const res = await fetch(url, { signal: ac.signal, headers: { accept: "application/json" } });
+    if (!res.ok) throw new Error(`price upstream http ${res.status}`);
+    const json = await res.json();
+    setCache(url, { at: Date.now(), ttl, body: Buffer.from(JSON.stringify(json)) });
+    return json;
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+/** Native-token USD price, or null when unavailable. Never throws. */
+async function nativeUsdPrice(spec: ChainSpec): Promise<number | null> {
+  if (!USD_PRICES || !spec.coingeckoId) return null;
+  try {
+    const json = await fetchJsonCached(`${PRICE_URL}/prices/current/coingecko:${spec.coingeckoId}`, TTL_PRICE_MS);
+    const price = Number(json?.coins?.[`coingecko:${spec.coingeckoId}`]?.price);
+    return Number.isFinite(price) && price > 0 ? price : null;
+  } catch (err) {
+    log("warn", "price_upstream_failed", { chain: spec.id, detail: String(err) });
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
@@ -218,16 +325,21 @@ export async function handleGas(req: Request, res: Response): Promise<void> {
   const chains: Record<string, unknown> = {};
   const failed: Array<{ chain: string; error: string }> = [];
 
-  for (const spec of specs) {
-    let snapshot;
-    try {
-      const fh = await feeHistoryFor(spec, SNAPSHOT_BLOCKS, TTL_GAS_MS);
-      snapshot = snapshotFromFeeHistory(fh);
-    } catch (err) {
-      log("error", "gas_rpc_failed", { chain: spec.id, detail: String(err) });
-      failed.push({ chain: spec.id, error: String(err) });
+  // Fetch every chain in parallel. Sequentially, one slow node would serialise
+  // the whole request even though each call already has its own timeout.
+  const settled = await Promise.allSettled(
+    specs.map(async (spec) => ({ spec, data: await fetchGasData(spec, SNAPSHOT_BLOCKS, TTL_GAS_MS) })),
+  );
+
+  for (const [i, outcome] of settled.entries()) {
+    if (outcome.status === "rejected") {
+      const failedSpec = specs[i];
+      log("error", "gas_rpc_failed", { chain: failedSpec.id, detail: String(outcome.reason) });
+      failed.push({ chain: failedSpec.id, error: String(outcome.reason) });
       continue;
     }
+    const { spec, data } = outcome.value;
+    const snapshot = data.snapshot;
     const priorityGwei = {
       slow: weiToGwei(snapshot.priority.slow),
       normal: weiToGwei(snapshot.priority.normal),
@@ -257,6 +369,12 @@ export async function handleGas(req: Request, res: Response): Promise<void> {
         normal: asWei(snapshot.nextBaseFeeWei + snapshot.priority.normal),
         fast: asWei(snapshot.nextBaseFeeWei + snapshot.priority.fast),
       },
+      // Congestion and blob fees ride along with feeHistory — no extra RPC call.
+      congestion: data.congestion,
+      blobBaseFeeGwei: data.blobBaseFeeGwei,
+      // Server-side advisory: where the next base fee sits inside the recent
+      // window, plus maxFeePerGas values that drop straight into a transaction.
+      advice: adviceFrom(snapshot.nextBaseFeeWei, snapshot.priority, data.baseFeeGwei),
     };
   }
 
@@ -287,21 +405,39 @@ export async function handleHistory(req: Request, res: Response): Promise<void> 
   const chains: Record<string, unknown> = {};
   const failed: Array<{ chain: string; error: string }> = [];
 
-  for (const spec of specs) {
-    try {
-      const fh = await feeHistoryFor(spec, blocks, TTL_HISTORY_MS);
-      const series = historyFromFeeHistory(fh);
-      chains[spec.id] = {
-        label: spec.label,
-        nativeSymbol: spec.nativeSymbol,
-        blockNumbers: series.blockNumbers,
-        baseFeeGwei: series.baseFeeGwei,
-        priorityGwei: { slow: series.priority.slow, normal: series.priority.normal, fast: series.priority.fast },
-      };
-    } catch (err) {
-      log("error", "history_rpc_failed", { chain: spec.id, detail: String(err) });
-      failed.push({ chain: spec.id, error: String(err) });
+  const settled = await Promise.allSettled(
+    specs.map(async (spec) => ({ spec, data: await fetchGasData(spec, blocks, TTL_HISTORY_MS) })),
+  );
+
+  for (const [i, outcome] of settled.entries()) {
+    if (outcome.status === "rejected") {
+      const failedSpec = specs[i];
+      log("error", "history_rpc_failed", { chain: failedSpec.id, detail: String(outcome.reason) });
+      failed.push({ chain: failedSpec.id, error: String(outcome.reason) });
+      continue;
     }
+    const { spec, data } = outcome.value;
+    // Where was the cheapest block in this window? The answer is only useful if
+    // you also get the block number, so both are returned together.
+    let cheapestIdx = 0;
+    for (let k = 1; k < data.baseFeeGwei.length; k++) {
+      if (data.baseFeeGwei[k] < data.baseFeeGwei[cheapestIdx]) cheapestIdx = k;
+    }
+    chains[spec.id] = {
+      label: spec.label,
+      nativeSymbol: spec.nativeSymbol,
+      blockNumbers: data.blockNumbers,
+      baseFeeGwei: data.baseFeeGwei,
+      priorityGwei: data.priorityGwei,
+      gasUsedRatio: data.gasUsedRatio.length ? data.gasUsedRatio : null,
+      blobBaseFeeGwei: data.blobBaseFeeGwei,
+      summary: {
+        ...seriesStats(data.baseFeeGwei),
+        trend: trendOf(data.baseFeeGwei),
+        cheapestBlockNumber: data.blockNumbers[cheapestIdx] ?? null,
+        cheapestBaseFeeGwei: data.baseFeeGwei[cheapestIdx] ?? null,
+      },
+    };
   }
 
   if (specs.length > 0 && Object.keys(chains).length === 0) {
@@ -332,21 +468,29 @@ export async function handleEstimate(req: Request, res: Response): Promise<void>
   }
   const spec = specs[0];
 
-  let snapshot;
-  try {
-    const fh = await feeHistoryFor(spec, SNAPSHOT_BLOCKS, TTL_GAS_MS);
-    snapshot = snapshotFromFeeHistory(fh);
-  } catch (err) {
-    log("error", "estimate_rpc_failed", { chain: spec.id, detail: String(err) });
-    res.status(502).json({ error: "rpc unreachable", detail: String(err) });
+  // The price lookup is best-effort and must never fail a paid request, so it
+  // runs alongside the fee fetch and simply degrades to null.
+  const [feeResult, usdPrice] = await Promise.all([
+    feeHistoryFor(spec, SNAPSHOT_BLOCKS, TTL_GAS_MS).then(
+      (fh) => ({ ok: true as const, fh }),
+      (err: unknown) => ({ ok: false as const, err }),
+    ),
+    nativeUsdPrice(spec),
+  ]);
+  if (!feeResult.ok) {
+    log("error", "estimate_rpc_failed", { chain: spec.id, detail: String(feeResult.err) });
+    res.status(502).json({ error: "rpc unreachable", detail: String(feeResult.err) });
     return;
   }
+  const snapshot = snapshotFromFeeHistory(feeResult.fh);
 
   const limit = BigInt(gasLimit);
   const speed = (p: bigint) => {
     const totalWei = snapshot.nextBaseFeeWei + p;
     const { costWei, costNative } = estimateCost(totalWei, limit, spec.nativeDecimals);
-    return { totalGwei: weiToGwei(totalWei), costWei, costNative };
+    const out: Record<string, unknown> = { totalGwei: weiToGwei(totalWei), costWei, costNative };
+    if (usdPrice !== null) out.costUsd = Number((costNative * usdPrice).toFixed(6));
+    return out;
   };
 
   res.json({
@@ -367,6 +511,9 @@ export async function handleEstimate(req: Request, res: Response): Promise<void>
       normal: speed(snapshot.priority.normal),
       fast: speed(snapshot.priority.fast),
     },
+    // null when the chain has no public price feed (Kite) or the price upstream
+    // is unreachable — the native-token cost is always returned regardless.
+    nativeUsdPrice: usdPrice,
   });
 }
 
