@@ -9,9 +9,9 @@ Every row below is a **real on-chain settlement** produced by the buyer script i
 
 | Endpoint | Tier | Price | Transaction | Buyer |
 | --- | --- | --- | --- | --- |
-| `GET /v1/gas` | standard | $0.001 | _(run `npm run selfpay`)_ | _(run `npm run selfpay`)_ |
-| `GET /v1/history` | premium | $0.01 | _(run `npm run selfpay`)_ | _(run `npm run selfpay`)_ |
-| `POST /v1/estimate` | premium | $0.01 | _(run `npm run selfpay`)_ | _(run `npm run selfpay`)_ |
+| `GET /v1/gas` | standard | $0.001 | 0xa26df9f85a4d190a5b42ec5b66b8af6bd88eee383b6bc2d77244b2da294bdd04 | 0x92DF53ED56E3baCc6b9F2b1E10ACdA5355Fbf9C9 |
+| `GET /v1/history` | premium | $0.01 | 0xa7e4f3f42fa5176273174d4a7237fe2f244ba4f7b666dd9824ef5e016af8a8e6 | 0x92DF53ED56E3baCc6b9F2b1E10ACdA5355Fbf9C9 |
+| `POST /v1/estimate` | premium | $0.01 | 0x1077465c824d00880d8bb7974064c2d69a9385266bf90a52097b32d9c65bc8bd | 0x92DF53ED56E3baCc6b9F2b1E10ACdA5355Fbf9C9 |
 
 Settlement parameters (read from the live `402` challenge):
 
