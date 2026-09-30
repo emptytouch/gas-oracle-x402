@@ -1,0 +1,10 @@
+node_modules/
+.env
+.kite-passport/
+proof/
+kite-catalog/
+dist/
+*.log
+
+# vitest writes a temp compiled config next to the source config
+vitest.config.ts.timestamp-*.mjs
