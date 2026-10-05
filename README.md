@@ -101,19 +101,30 @@ the cheapest block in the window and the direction fees are heading:
   "blocks": 20,
   "chains": {
     "ethereum": {
-      "blockNumbers": [23123437, 23123438],
-      "baseFeeGwei": [0.98, 1.02],
-      "priorityGwei": { "slow": [0.04, 0.05], "normal": [0.11, 0.12], "fast": [0.28, 0.31] },
-      "gasUsedRatio": [0.51, 0.74],
+      "blockNumbers": [23123437, 23123438, 23123439, 23123440],
+      "baseFeeGwei": [1.02, 0.98, 1.05, 1.01],
+      "priorityGwei": {
+        "slow":   [0.05, 0.04, 0.05, 0.04],
+        "normal": [0.12, 0.11, 0.12, 0.11],
+        "fast":   [0.31, 0.28, 0.31, 0.30]
+      },
+      "gasUsedRatio": [0.74, 0.51, 0.63, 0.49],
       "blobBaseFeeGwei": 0.0081,
       "summary": {
-        "min": 0.91, "median": 1.02, "max": 1.31, "mean": 1.04,
+        "min": 0.98,
+        "median": 1.015,
+        "max": 1.05,
+        "mean": 1.015,
         "trend": "falling",
-        "cheapestBlockNumber": 23123441,
-        "cheapestBaseFeeGwei": 0.91
+        "cheapestBlockNumber": 23123438,
+        "cheapestBaseFeeGwei": 0.98
       }
     }
-  }
+  },
+  "count": 1,
+  "missing": [],
+  "failed": [],
+  "updatedAt": 1790000000000
 }
 ```
 
@@ -128,9 +139,17 @@ curl -X POST https://gas-oracle-x402.onrender.com/v1/estimate \
 ```json
 {
   "chain": "ethereum",
+  "label": "Ethereum",
   "nativeSymbol": "ETH",
   "gasLimit": 21000,
+  "blockNumber": 23123456,
+  "baseFeeGwei": 1.02,
   "nextBaseFeeGwei": 2,
+  "priorityGwei": {
+    "slow": 0.1,
+    "normal": 1,
+    "fast": 2
+  },
   "nativeUsdPrice": 2500,
   "speeds": {
     "slow":   { "totalGwei": 2.1, "costWei": "44100000000000", "costNative": 0.0000441, "costUsd": 0.11025 },
@@ -144,6 +163,31 @@ curl -X POST https://gas-oracle-x402.onrender.com/v1/estimate \
 no public price feed (Kite), `nativeUsdPrice` is `null` and `costUsd` is omitted —
 the native-token cost is still returned, and the request still succeeds. That is
 deliberate: the client already paid, so an optional enrichment must never fail it.
+
+A degraded response (Kite, no public price) looks like:
+
+```json
+{
+  "chain": "kite",
+  "label": "Kite",
+  "nativeSymbol": "KITE",
+  "gasLimit": 21000,
+  "blockNumber": 22041780,
+  "baseFeeGwei": 182,
+  "nextBaseFeeGwei": 182,
+  "priorityGwei": { "slow": 0, "normal": 0, "fast": 7 },
+  "nativeUsdPrice": null,
+  "speeds": {
+    "slow":   { "totalGwei": 182, "costWei": "3822000000000000", "costNative": 0.003822 },
+    "normal": { "totalGwei": 182, "costWei": "3822000000000000", "costNative": 0.003822 },
+    "fast":   { "totalGwei": 189, "costWei": "3969000000000000", "costNative": 0.003969 }
+  }
+}
+```
+
+Note the `priorityGwei.slow` / `normal` are `0`: Kite's `eth_feeHistory` reports no
+priority-fee market for those percentiles, so the service reports zero instead of
+inventing numbers — same principle as the non-EIP-1559 fallback.
 
 ## Chains
 
@@ -179,7 +223,8 @@ client, or use the bundled self-pay script:
 ```bash
 export BUYER_PRIVATE_KEY=0x<kite-testnet-key-holding-pieUSD>
 BASE_URL=https://gas-oracle-x402.onrender.com npm run selfpay
-QUOTE_ENDPOINT=estimate EST_CHAIN=ethereum EST_GAS_LIMIT=21000 npm run selfpay
+BASE_URL=https://gas-oracle-x402.onrender.com QUOTE_ENDPOINT=history  CHAINS=ethereum BLOCKS=20 npm run selfpay
+BASE_URL=https://gas-oracle-x402.onrender.com QUOTE_ENDPOINT=estimate EST_CHAIN=ethereum EST_GAS_LIMIT=21000 npm run selfpay
 npm run proof            # writes the settlement tx hashes into PROOF.md
 ```
 
